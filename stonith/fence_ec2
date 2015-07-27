@@ -1,0 +1,355 @@
+#!/bin/bash
+
+description="
+fence_ec2 is an I/O Fencing agent which can be used with Amazon EC2 instances.
+In order to function, the agent needs the private key and cert used by the Amazon EC2 API.
+
+API functions used by this agent:
+- ec2-describe-tags
+- ec2-describe-instances
+- ec2-stop-instances
+- ec2-start-instances
+- ec2-reboot-instances
+
+If the uname used by the cluster node is any of:
+ - Public DNS name (or part there of),
+ - Private DNS name (or part there of),
+ - Instance ID (eg. i-4f15a839)
+ - Contents of tag associated with the instance
+then the agent should be able to automatically discover the instances it can control.
+
+If the tag containing the uname is not [Name], then it will need to be specified using the [tag] option.
+"
+
+#
+#  This file was originally obtained through:
+#
+#  https://github.com/beekhof/fence_ec2
+#
+#  I have modified it to work with the AWS CLI utils, instead of the java utils.
+#
+# Copyright (c) 2015
+#                    All Rights Reserved.
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#######################################################################
+
+quiet=0
+port=""
+
+instance_not_found=0
+unknown_are_stopped=0
+
+action="reset"         # Default fence action
+ec2_tag="Name"	       # EC2 Tag containing the instance's uname
+ec2_region="us-east-1" # EC2 Region
+
+function usage()
+{
+cat <<EOF
+`basename $0` - A fencing agent for Amazon EC2 instances
+
+$description
+
+Usage: `basename $0` -o|--action [-n|--port] [options]
+Options:
+ -h, --help 		This text
+ -V, --version	Version information
+ -q, --quiet 		Reduced output mode
+
+Commands:
+ -o, --action		Action to perform: on|off|reboot|status|monitor
+ -n, --port 		The name of a machine/instance to control/check
+
+Additional Options:
+ -r, --region		The Amazon region for which the device should control instances (defaults to us-east-1)
+ -t, --tag 		Name of the tag containing the instance's uname
+
+Dangerous options:
+ -U, --unknown-are-stopped 	Assume any unknown instance is safely stopped
+
+EOF
+    exit 0;
+}
+
+function metadata()
+{
+cat <<EOF
+<?xml version="1.0" ?>
+<resource-agent name="fence_ec2" shortdesc="Fencing agent for Amazon EC2 instances" >
+    <longdesc>
+$description
+    </longdesc>
+    <parameters>
+	<parameter name="action" unique="1" required="0">
+		<getopt mixed="-o, --action=[action]" />
+		<content type="string" default="reboot" />
+		<shortdesc lang="en">Fencing Action</shortdesc>
+	</parameter>
+	<parameter name="port" unique="1" required="0">
+		<getopt mixed="-n, --port=[port]" />
+		<content type="string" />
+		<shortdesc lang="en">The name/id/tag of a instance to control/check</shortdesc>
+	</parameter>
+	<parameter name="region" unique="1" required="0">
+		<getopt mixed="-r, --region=[region]" />
+		<content type="string" default="us-east-1" />
+		<shortdesc lang="en">The Amazon region for which the device should control instances</shortdesc>
+	</parameter>
+	<parameter name="tag" unique="1" required="0">
+		<getopt mixed="-t, --tag=[tag]" />
+		<content type="string" default="Name" />
+		<shortdesc lang="en">Name of the tag containing the instances uname</shortdesc>
+	</parameter>
+	<parameter name="unknown-are-stopped" unique="1" required="0">
+		<getopt mixed="-U, --unknown-are-stopped" />
+		<content type="string" default="false" />
+		<shortdesc lang="en">DANGER: Assume any unknown instance is safely stopped</shortdesc>
+	</parameter>
+    </parameters>
+    <actions>
+	<action name="on" />
+	<action name="off" />
+	<action name="reboot" />
+	<action name="status" />
+	<action name="list" />
+	<action name="monitor" />
+	<action name="metadata" />
+    </actions>
+</resource-agent>
+EOF
+    exit 0;
+}
+
+instance_for_port()
+{
+    port=$1; shift
+    instance_regex='^i-[0-9a-z]{8}$'
+
+    if [[ ! "${port}" =~ $instance_regex ]]; then
+        #echo "port ${port} does not appear to be an InstanceID, looking for alternative..."
+        # Look for port name -n in the INSTANCE data
+        #instance=$(ec2-describe-instances "$@" | grep "INSTANCE.*$port" | awk '{print $2}')
+        # Look for port name -n in the Name TAG
+        #instance=$(ec2-describe-tags "$@" | grep "TAG.*instance.*$ec2_tag.*$port" | awk '{print $3}')
+        instance=$(aws "$@" ec2 describe-tags  --query Tags[0].ResourceId --output=text --filters "Name=resource-type,Values=instance" "Name=key,Values=Name" "Name=value,Values=${port}")
+
+        if [ -z $instance ]; then
+      # Look for port name -n in the Name TAG
+        #instance=`ec2-describe-tags $* | grep TAG.*instance.*$ec2_tag.*$port | awk '{print $3}'`
+        instance=$(aws "$@" ec2 describe-tags  --query Tags[0].ResourceId --output=text --filters "Name=resource-type,Values=instance" "Name=key,Values=${ec2_tag}" "Name=value,Values=${port}")
+
+        fi
+    else
+        #echo "port $port appears to be an InstanceID. Confirming..."
+        instance=$(aws "$@" ec2 describe-instances --instance-ids ${port} --output text --query Reservations[0].Instances[0].InstanceId)
+    fi
+
+    if [[ ! "${instance}" =~ $instance_regex ]]; then
+	      instance_not_found=1
+	      instance=$port
+    fi
+
+    echo "${instance}"
+}
+
+get_instance_state()
+{
+    instance_state=$(aws ${options} ec2 describe-instances --instance-ids ${instance} --output text --query Reservations[0].Instances[0].State.Name)
+}
+
+wait_for_stop()
+{
+  aws ec2 wait instance-stopped --instance-ids ${instance}
+}
+
+ec2_stop()
+{
+    get_instance_state
+
+    if [ ${instance_state} = "stopped" ]
+    then
+        return 0
+    elif [ ${instance_state} = "stopping" ]
+    then
+        wait_for_stop
+        return 0
+    elif [ ${instance_state} = "pending" -o ${instance_state} = "running" ]
+    then
+        aws ${options} ec2 stop-instances --instance-ids "${instance}"
+        wait_for_stop
+        return 0
+    else
+        return 1
+    fi
+}
+
+ec2_start()
+{
+    get_instance_state
+
+	  echo "Starting $instance."
+    if [ ${instance_state} = "stopped" -o ${instance_state} = "stopping" ]; then
+        echo "Starting $instance."
+        aws ${options} ec2 start-instances --instance-ids  "${instance}"
+        return 0
+    elif [ ${instance_state} = "pending" -o ${instance_state} = "running" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+ec2_list()
+{
+    name_list=$(aws ${options} ec2 describe-instances --query Reservations[].Instances[].InstanceId --query 'Reservations[].Instances[].[PublicDnsName, InstanceId, PrivateDnsName]' --output=text)
+    name_list="${name_list} $(aws  ${options} ec2 describe-tags --filters "Name=resource-type,Values=instance" --query Tags[].Value --output=text)"
+    echo $name_list | tr ' ' '\n' | sort -u
+
+    # Since AWS *is* our "fence device", we will unequivically return 0
+
+    return 0
+}
+
+# This is used by pacemaker to verify that the agent is working. It is not required by 'fenced'. Use is encouraged. Return values:
+#   0 if the fence device is reachable and the port (instance) is in the on state
+#   1 if the fence device could not be contacted
+#   2 if the fence device is reachable but the port (instance) in the off state
+ec2_status()
+{
+    get_instance_state
+    if [ ${instance_state} = "stopped" ]; then
+        return 2
+    else
+        return 0
+    fi
+}
+
+# Attempt to contact the fencing device. Typically, 'status' for one-port hardware, and 'list' for multi-port hardware. Return values:
+#   0 if the fence device is reachable and working properly
+#   1 if the fence device could not be contacted
+#   2 if the fence device is reachable but the port (instance) in the off state (single-port hardware only)
+ec2_monitor()
+{
+    get_instance_state
+    if [ ${instance_state} = "stopped" ]; then
+        return 2
+    else
+        return 0
+    fi
+}
+
+TEMP=`getopt -o qVo:e:k:c:r:n:t:U -l version,help,region:,action:,port:,option:,ec2-home:,private-key:,cert:,tag:,quiet,unknown-are-stopped -n 'fence_ec2' -- "$@"`
+
+if [ $? != 0 ];then
+    usage
+    exit 1
+fi
+
+# Note the quotes around `$TEMP': they are essential!
+eval set -- "$TEMP"
+
+if [ -z $2 ]; then
+    # If there are no command line args, look for options from stdin
+    while read line; do
+	case $line in
+      option=*|action=*)    action=`echo $line | sed s/.*=//`;;
+      port=*)               port=`echo $line | sed s/.*=//`;;
+	    ec2-home=*)           EC2_HOME=`echo $line | sed s/.*=//`;;
+	    private-key=*)        ec2_key=`echo $line | sed s/.*=//`;;
+	    cert=*)               ec2_cert=`echo $line | sed s/.*=//`;;
+	    region=*)             ec2_region=`echo $line | sed s/.*=//`;;
+	    tag=*)                ec2_tag=`echo $line | sed s/.*=//`;;
+	    quiet*)               quiet=1;;
+	    unknown-are-stopped*) unknown_are_stopped=1;;
+	    --);;
+	    *) echo "Invalid command: $line";;
+	esac
+    done
+fi
+
+while true ; do
+    case "$1" in
+	-o|--action|--option)     action=$2;      shift; shift;;
+	-n|--port)                port=$2;        shift; shift;;
+	-e|--ec2-home)            EC2_HOME=$2;    shift; shift;;
+	-k|--private-key)         ec2_key=$2;     shift; shift;;
+	-c|--cert)	              ec2_cert=$2;    shift; shift;;
+	-r|--region)              ec2_region=$2;  shift; shift;;
+	-t|--tag)	                ec2_tag=$2;     shift; shift;;
+	-U|--unknown-are-stopped) unknown_are_stopped=1; shift;;
+	-q|--quiet)               quiet=1;        shift;;
+	-V|--version) echo "1.0.0"; exit 0;;
+	--help|-h)
+	    usage;
+	    exit 0;;
+	--) shift ; break ;;
+	*) echo "Unknown option: $1. See --help for details."; exit 1;;
+    esac
+done
+
+action=$(echo $action | tr 'A-Z' 'a-z')
+
+if [ "$action" = "metadata" ]; then
+    metadata
+fi
+
+options="--region $ec2_region"
+
+instance=""
+if [ ! -z "$port" ]; then
+    instance=$(instance_for_port $port $options)
+fi
+
+case $action in
+    reboot|reset)
+        ec2_stop
+        sleep 5
+        ec2_start
+    ;;
+    poweron|on)
+        ec2_start
+    ;;
+    poweroff|off)
+        ec2_stop
+    ;;
+    monitor)
+        ec2_monitor
+	      #ec2-describe-instances $options | grep INSTANCE &> /dev/null
+    ;;
+    hostlist|list)
+        ec2_list
+    ;;
+    stat|status)
+        ec2_status
+	# List of instances and their current status
+    ;;
+    metadata)
+	      metadata
+    ;;
+    *)
+        echo "Unknown action: $action"; exit 1;;
+esac
+
+status=$?
+
+if [ $quiet -eq 1 ]; then
+    : nothing
+elif [ $status -eq 0 ]; then
+    echo "Operation $action passed"
+else
+    echo "Operation $action failed: $status"
+fi
+exit $status

@@ -1,0 +1,212 @@
+#!/bin/sh -x
+#
+#
+#	Resource Agent for AWS EC2 ENI
+#
+#  This file was orginally obtained through:
+
+#   https://github.com/moomindani/aws-eip-resource-agent
+#
+#
+# Copyright (c) 2014 mooapp All Rights Reserved.
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#######################################################################
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="eni" version="0.9">
+<version>1.0</version>
+
+<longdesc lang="en">
+This is a Resource Agent for AWS EC2 ENI (Elastic IP Address).
+</longdesc>
+<shortdesc lang="en">AWS EC2 EIP resource agent</shortdesc>
+
+<parameters>
+<parameter name="ec2_region" required="1">
+<longdesc lang="en">
+The EC2 Rgion
+</longdesc>
+<shortdesc lang="en">ec2_region</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="eni_id" required="1">
+<longdesc lang="en">
+The network interface id of ENI
+</longdesc>
+<shortdesc lang="en">ENI id</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="device_index">
+<longdesc lang="en">
+The index of the device for the network interface attachment.
+</longdesc>
+<shortdesc lang="en">device index</shortdesc>
+<content type="integer" default="1" />
+</parameter>
+
+<parameter name="device_name">
+<longdesc lang="en">
+The name of the device for the network interface attachment.
+</longdesc>
+<shortdesc lang="en">device index</shortdesc>
+<content type="string" default="eth1" />
+</parameter>
+
+<parameter name="gateway" required="1">
+<longdesc lang="en">
+The gateway of the device for the network interface attachment.
+</longdesc>
+<shortdesc lang="en">gateway</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="wait">
+<longdesc lang="en">
+The wait time after starting and stopping interface in order to handle delay.
+</longdesc>
+<shortdesc lang="en">wait</shortdesc>
+<content type="integer" default="30" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="20" />
+<action name="stop"         timeout="20" />
+<action name="monitor"      timeout="20" interval="10" depth="0" />
+<action name="meta-data"    timeout="5" />
+<action name="validate-all"   timeout="20" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+
+get_attachment_id() {
+    /usr/bin/aws --region ${OCF_RESKEY_ec2_region} ec2 describe-network-interfaces --network-interface-id ${OCF_RESKEY_eni_id} --query NetworkInterfaces[0].Attachment.AttachmentId --output text
+}
+
+detach_eni() {
+    attachment_id=$(get_attachment_id)
+    while [ "${attachment_id}" != "None" ]; do
+      /usr/bin/aws --region ${OCF_RESKEY_ec2_region} ec2 detach-network-interface --attachment-id ${attachment_id} --force
+      sleep 5
+      attachment_id=$(get_attachment_id)
+    done
+}
+
+attach_eni() {
+    attachment_id=$(get_attachment_id)
+
+    if [ "${attachment_id}" != "None" ]; then
+        detach_eni
+    fi
+
+    while [ "${attachment_id}" = "None" ]; do
+        /usr/bin/aws --region ${OCF_RESKEY_ec2_region} ec2 attach-network-interface --network-interface-id ${OCF_RESKEY_eni_id} --instance-id ${instance_id} --device-index ${OCF_RESKEY_device_index}
+        sleep 5
+        attachment_id=$(get_attachment_id)
+    done
+}
+
+get_route_table_id() {
+  private_ip=$(/usr/sbin/ip addr show dev ${OCF_RESKEY_device_name} | awk '/inet /{split($2,a,"/"); print a[1]}')
+  /usr/sbin/ip rule | grep ${private_ip} | awk '{print $NF}'
+}
+
+eni_usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+eni_start() {
+    eni_monitor
+    if [ $? = $OCF_SUCCESS ]; then
+	      return $OCF_SUCCESS
+    fi
+
+    attach_eni
+    while [ -z ${route_table_id} ]; do
+        route_table_id=$(get_route_table_id)
+        sleep 2
+    done
+    /usr/sbin/ip route add default via ${OCF_RESKEY_gateway} dev ${OCF_RESKEY_device_name} table ${route_table_id}
+    ip route flush cache
+    return $OCF_SUCCESS
+}
+
+eni_stop() {
+    eni_monitor
+    if [ $? =  $OCF_SUCCESS ]; then
+        detach_eni
+    fi
+    return $OCF_SUCCESS
+}
+
+eni_monitor() {
+    # Verify that the eni is attached to this instance
+    mon=$(/usr/bin/aws --region ${OCF_RESKEY_ec2_region} ec2 describe-network-interfaces --network-interface-ids ${OCF_RESKEY_eni_id} --filter "Name=attachment.instance-id, Values=${instance_id}" --output json | grep ${instance_id} | wc -l)
+    if [ $mon -ne 0  ]; then
+        route_table_id=$(get_route_table_id)
+        #default_route_count=$(/usr/sbin/ip route show table ${route_table_id} | /usr/bin/grep -c "^default.*${OCF_RESKEY_gateway}.*${OCF_RESKEY_device_name}")
+        default_route_count=$(/usr/sbin/ip route show table ${route_table_id} | /usr/bin/grep -c "^default")
+        if [ "${default_route_count}" -gt 0 ]; then
+            return $OCF_SUCCESS
+        fi
+    fi
+    return $OCF_NOT_RUNNING
+}
+
+eni_validate() {
+    return $OCF_SUCCESS
+}
+
+instance_id=`wget -q -O - http://169.254.169.254/latest/meta-data/instance-id`
+
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		eni_start;;
+stop)		eni_stop;;
+monitor)	eni_monitor;;
+validate-all)   eni_validate;;
+usage|help)	eni_usage
+		exit $OCF_SUCCESS
+		;;
+*)		eni_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
